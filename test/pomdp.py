@@ -9,6 +9,11 @@ from dreamerv2.training.config import MinAtarConfig
 from dreamerv2.training.trainer import Trainer
 from dreamerv2.training.evaluator import Evaluator
 
+from dreamerv2.models.max_actor2 import MaxActionModel
+from dreamerv2.utils.wrapper import encodingDreamer
+
+from dreamerv2.models.sac_discrete import parse_args as other_parse_args
+
 pomdp_wrappers = {
     'breakout':breakoutPOMDP,
     'seaquest':seaquestPOMDP,
@@ -17,8 +22,37 @@ pomdp_wrappers = {
     'freeway':freewayPOMDP,
 }
 
+# env_name = 1
+# exp_id = 1
+# result_dir = os.path.join('results', '{}_{}'.format(env_name, exp_id))
+# model_dir = os.path.join(result_dir, 'models/models_best.pth')
+
+# saved_dict = torch.load(model_dir)
+# self.ObsEncoder.load_state_dict(saved_dict["ObsEncoder"])
+# self.ObsDecoder.load_state_dict(saved_dict["ObsDecoder"])
+
+# #learnt world-models desc
+# obs_encoder: Dict = field(default_factory=lambda:{'layers':3, 'node_size':100, 'dist': None, 'activation':nn.ELU, 'kernel':3, 'depth':16})
+# obs_decoder: Dict = field(default_factory=lambda:{'layers':3, 'node_size':100, 'dist':'normal', 'activation':nn.ELU, 'kernel':3, 'depth':16})
+# if config.pixel:
+#     self.ObsEncoder = ObsEncoder(obs_shape, embedding_size, config.obs_encoder).to(self.device).eval()
+#     self.ObsDecoder = ObsDecoder(obs_shape, modelstate_size, config.obs_decoder).to(self.device).eval()
+# else:
+#     self.ObsEncoder = DenseModel((embedding_size,), int(np.prod(obs_shape)), config.obs_encoder).to(self.device).eval()
+#     self.ObsDecoder = DenseModel(obs_shape, modelstate_size, config.obs_decoder).to(self.device).eval()
+
 def main(args):
-    wandb.login()
+    # wandb.login()
+    wandb.init(
+        project='dreamermax',
+        # entity=self.args.wandb_entity,
+        sync_tensorboard=True,
+        # config=vars(other_parse_args), # | vars(args),
+        # name=self.run_name,
+        monitor_gym=True,
+        # save_code=True,
+    )
+
     env_name = args.env
     exp_id = args.id + '_pomdp'
 
@@ -59,7 +93,10 @@ def main(args):
     config_dict = config.__dict__
     trainer = Trainer(config, device)
     evaluator = Evaluator(config, device)
-    
+
+    obs = env.reset()
+    maxtrainer = MaxActionModel(encodingDreamer(env, trainer))
+
     with wandb.init(project='mastering MinAtar with world models', config=config_dict):
         """training loop"""
         print('...training...')
@@ -83,23 +120,32 @@ def main(args):
                 trainer.save_model(iter)
             with torch.no_grad():
                 embed = trainer.ObsEncoder(torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(trainer.device))  
+                print(f"PREV ACTION: {prev_action=} {prev_action.shape=}")
                 _, posterior_rssm_state = trainer.RSSM.rssm_observe(embed, prev_action, not done, prev_rssmstate)
                 model_state = trainer.RSSM.get_model_state(posterior_rssm_state)
                 
                 ### !11111111111111111111111111111111111111111111111111111
-                action, action_dist = trainer.ActionModel(model_state)
-                action = trainer.ActionModel.add_exploration(action, iter).detach()
-                action_ent = torch.mean(action_dist.entropy()).item()
-                episode_actor_ent.append(action_ent)
+                if False: #iter < 10**5:
+                    action, action_dist = trainer.ActionModel(model_state)
+                    action = trainer.ActionModel.add_exploration(action, iter).detach()
+                    action_ent = torch.mean(action_dist.entropy()).item()
+                    episode_actor_ent.append(action_ent)
+                else:
+                    action, action_probs = maxtrainer()
+                    print(f"{action_probs}")
+                    action_dist = torch.distributions.OneHotCategorical(probs=action_probs)
+                    action_ent = torch.mean(action_dist.entropy()).item()
+                    episode_actor_ent.append(action_ent)
                 ### !11111111111111111111111111111111111111111111111111111
                 
-
-            next_obs, rew, done, _ = env.step(action.squeeze(0).cpu().numpy())
+            # next_obs, rew, done, _ = env.step(action.squeeze(0).cpu().numpy())
+            next_obs, rew, done, _ = env.step(action) #.cpu().numpy())
             score += rew
 
             if done:
                 train_episodes += 1
-                trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
+                # trainer.buffer.add(obs, action.squeeze(0).cpu().numpy(), rew, done)
+                trainer.buffer.add(obs, action, rew, done)
                 train_metrics['train_rewards'] = score
                 train_metrics['action_ent'] =  np.mean(episode_actor_ent)
                 train_metrics['train_steps'] = iter
@@ -120,10 +166,11 @@ def main(args):
                 prev_action = torch.zeros(1, trainer.action_size).to(trainer.device)
                 episode_actor_ent = []
             else:
-                trainer.buffer.add(obs, action.squeeze(0).detach().cpu().numpy(), rew, done)
+                # trainer.buffer.add(obs, action.squeeze(0).detach().cpu().numpy(), rew, done)
+                trainer.buffer.add(obs, action, rew, done)
                 obs = next_obs
                 prev_rssmstate = posterior_rssm_state
-                prev_action = action
+                prev_action = torch.from_numpy(action).unsqueeze(0).to(trainer.device)
 
     '''evaluating probably best model'''
     evaluator.eval_saved_agent(env, best_save_path)
@@ -142,6 +189,6 @@ if __name__ == "__main__":
     # Max parameters
     parser.add_argument('-u', '--utility_measure', type=str, default='', help='choose utility measure')
     parser.add_argument('--record', type=bool, default=False, help='record max actions')
-    parser.add_argument('--record', type=bool, default=False, help='record max actions')
+    # parser.add_argument('--record', type=bool, default=False, help='record max actions')
     args = parser.parse_args()
     main(args)

@@ -51,22 +51,29 @@ class breakoutPOMDP(gym.ObservationWrapper):
         return np.stack([observation[0], observation[1], observation[3]], axis=0)
 
 class encodingDreamer(gym.ObservationWrapper):
-    def __init__(self, env, encoder):
+    def __init__(self, env, dreamertrainer):
         '''add dreamer encoding to observations'''
         super(encodingDreamer, self).__init__(env)
-
-        self.encoder = encoder
+        # self.device = torch.device('cpu')
+        self.dreamertrainer = dreamertrainer
         self.observation_space = gym.spaces.Box(
-            shape=(encoder.embedding_size,), low=-np.inf, high=np.inf 
+            shape=(self.encoder.embedding_size,), low=-np.inf, high=np.inf 
         )
 
-    def update_encoder(self, encoder):
-        self.encoder = encoder
+    @property
+    def encoder(self):
+        return self.dreamertrainer.ObsEncoder
 
     def observation(self, observation):
         with torch.no_grad():
-            return self.encoder(observation)
-
+            # print(observation.shape, "--shape of observation before wrapper")
+            encoder = self.encoder
+            encoder = encoder.to(torch.device('cpu'))
+            # observation = observation.to(self.device)
+            observation = encoder(torch.tensor(observation, dtype=torch.float32).unsqueeze(0))
+            encoder = encoder.to(torch.device('cuda'))
+            # print(observation.shape, "--shape of observation after wrapper")
+            return observation
     
 class asterixPOMDP(gym.ObservationWrapper):
     '''index 2 (trail) is removed, which gives ball's direction'''
