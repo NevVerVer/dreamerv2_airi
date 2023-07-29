@@ -5,6 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 
+import wandb
 import gym
 from gym import spaces
 import numpy as np
@@ -12,22 +13,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# from stable_baselines3.common.atari_wrappers import (
-#     ClipRewardEnv,
-#     EpisodicLifeEnv,
-#     FireResetEnv,
-#     MaxAndSkipEnv,
-#     NoopResetEnv,
-# )
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.distributions.categorical import Categorical
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from typing import Union
+
+import logging
+log = logging.getLogger(__name__)
+
 
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
+    parser.add_argument("--exp-name", type=str, default='breakout',
         help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=1, 
         help="seed of the experiment")
@@ -266,7 +264,8 @@ class Actor(nn.Module):
 # if __name__ == "__main__":
 class SAC(nn.Module):
     def __init__(self, d_state, d_action, replay_size, \
-        batch_size, n_updates, n_hidden, gamma, alpha, lr, tau, env):
+        batch_size, n_updates, n_hidden, gamma, alpha, lr, tau, env,
+                glob_agent_step):
         super(SAC, self).__init__()
         """
         Here you can see some args pass. We are not using them.
@@ -274,26 +273,14 @@ class SAC(nn.Module):
         """
 
         self.args = parse_args()
-        self.run_name = f"{self.args.env_id}__{self.args.exp_name}__{self.args.seed}__{int(time.time())}"
+        # self.run_name = f"{self.args.env_id}__{self.args.exp_name}__{self.args.seed}__{int(time.time())}"
         
-        if self.args.track:
-            import wandb
-
-            # wandb.init(
-            #     project=self.args.wandb_project_name,
-            #     entity=self.args.wandb_entity,
-            #     sync_tensorboard=True,
-            #     config=vars(self.args),
-            #     name=self.run_name,
-            #     monitor_gym=True,
-            #     save_code=True,
-            # )
-
-        self.writer = SummaryWriter(f"runs/{self.run_name}")
-        self.writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(self.args).items()])),
-        )
+        # commented it!!!
+        # self.writer = SummaryWriter(f"runs/{self.run_name}")
+        # self.writer.add_text(
+        #     "hyperparameters",
+        #     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(self.args).items()])),
+        # )
 
         # # TRY NOT TO MODIFY: seeding
         # random.seed(self.args.seed)
@@ -339,9 +326,12 @@ class SAC(nn.Module):
 
         # MAX SAC params
         self.normalizer = None
-        self.global_step = 0
+        self.global_episode_step = 0
+        self.global_update_step = 0
         self.n_updates = n_updates
-
+        
+        self.glob_agent_step = glob_agent_step
+        
     def setup_normalizer(self, normalizer):
         self.normalizer = normalizer
         self.replay.setup_transition_normailizer(normalizer)
@@ -352,6 +342,11 @@ class SAC(nn.Module):
     #     pass
     #     # TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+    def act_in_env(self, state):
+        if self.normalizer is not None:
+            state = self.normalizer.normalize_states(state)
+        return self.actor.get_action(state)
+        
     def create_new_replay(self):
         return ReplayBufferwithTransitionNormalizer(
             buffer_size=self.replay_params['replay_size'],
@@ -373,14 +368,13 @@ class SAC(nn.Module):
         # for global_step in range(self.args.total_timesteps):
         while not dones:
             # ALGO LOGIC: put action logic here
-            if self.global_step < self.args.learning_starts:
+            if self.global_episode_step < self.args.learning_starts:
                 # actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
                 # actions = np.array([env.action_space.sample() for _ in range(env.ensemble_size)])
                 actions = env.action_space.sample()
                 actions = torch.from_numpy(actions)
                 # print(f'sample action {type(actions)} {actions.shape}')
             else:
-                print(f'agent tries to act in imagination {type(actions)} {actions.shape}')
                 with torch.enable_grad():
                     actions, _, _ = self.actor.get_action(torch.Tensor(obs).to(self.device))
                 # actions = actions.detach().cpu().numpy()
@@ -388,14 +382,6 @@ class SAC(nn.Module):
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, rewards, dones, infos = env.step(actions) #envs.step(actions)
             # print(f"{obs.shape=}, {next_obs.shape=}, {actions.shape=}, {rewards=}, {dones=}, {infos=}")
-
-            # TRY NOT TO MODIFY: record rewards for plotting purposes
-            for info in infos:
-                if "episode" in info.keys():
-                    print(f"global_step={self.global_step}, episodic_return={info['episode']['r']}")
-                    self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], self.global_step)
-                    self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], self.global_step)
-                    break
 
             # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
             # real_next_obs = next_obs.copy()
@@ -407,7 +393,7 @@ class SAC(nn.Module):
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
-            self.global_step += 1
+            self.global_episode_step += 1
             episode_length += 1
 
         if train:
@@ -436,43 +422,46 @@ class SAC(nn.Module):
             next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.args.gamma * (min_qf_next_target)
                             #[64, 1]                   [64, 1]                                         [64, 3 ]
 
-        with torch.enable_grad():
-            # use Q-values only for the taken actions
-            qf1_values = self.qf1(data.observations)
-            qf2_values = self.qf2(data.observations)
-            qf1_a_values = qf1_values.squeeze().gather(1, data.actions.argmax(1).unsqueeze(1).long()).view(-1)
-            qf2_a_values = qf2_values.squeeze().gather(1, data.actions.argmax(1).unsqueeze(1).long()).view(-1)
-            # print(f"{qf2_values.shape=} {data.actions.shape=}")
-            # print(f"{qf2_a_values.shape=} {next_q_value.shape=}")
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
-
+        # with torch.enable_grad():
+        # use Q-values only for the taken actions
+        qf1_values = self.qf1(data.observations)
+        qf2_values = self.qf2(data.observations)
+        qf1_a_values = qf1_values.squeeze().gather(1, data.actions.argmax(1).unsqueeze(1).long()).view(-1)
+        qf2_a_values = qf2_values.squeeze().gather(1, data.actions.argmax(1).unsqueeze(1).long()).view(-1)
+        qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+        qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+        qf_loss = qf1_loss + qf2_loss
+        
         self.q_optimizer.zero_grad()
         qf_loss.backward()
+
+        clip = 5.
+        torch.nn.utils.clip_grad_norm_(self.qf1.parameters(), clip)
+        torch.nn.utils.clip_grad_norm_(self.qf2.parameters(), clip)
+        
         self.q_optimizer.step()
 
         # ACTOR training
-        with torch.enable_grad():
-            _, log_pi, action_probs = self.actor.get_action(data.observations)
+        # with torch.enable_grad():
+        _, log_pi, action_probs = self.actor.get_action(data.observations)
     
         with torch.no_grad():
             qf1_values = self.qf1(data.observations)
             qf2_values = self.qf2(data.observations)
             min_qf_values = torch.min(qf1_values, qf2_values)
         
-        with torch.enable_grad():
-            # no need for reparameterization, the expectation can be calculated for discrete actions
-            actor_loss = (action_probs * ((self.alpha * log_pi) - min_qf_values)).mean()
+        # with torch.enable_grad():
+        # no need for reparameterization, the expectation can be calculated for discrete actions
+        actor_loss = (action_probs * ((self.alpha * log_pi) - min_qf_values)).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
         if self.args.autotune:
-            with torch.enable_grad():
-                # re-use action probabilities for temperature loss
-                alpha_loss = (action_probs.detach() * (-self.log_alpha * (log_pi + self.target_entropy).detach())).mean()
+            # with torch.enable_grad():
+            # re-use action probabilities for temperature loss
+            alpha_loss = (action_probs.detach() * (-self.log_alpha * (log_pi + self.target_entropy).detach())).mean()
 
             self.a_optimizer.zero_grad()
             alpha_loss.backward()
@@ -480,133 +469,30 @@ class SAC(nn.Module):
             self.alpha = self.log_alpha.exp().item()
 
         # update the target networks
-        # if global_step % self.args.target_network_frequency == 0:
+        # if global_update_step % self.args.target_network_frequency == 0:
         for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
             target_param.data.copy_(self.args.tau * param.data + (1 - self.args.tau) * target_param.data)
         for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
             target_param.data.copy_(self.args.tau * param.data + (1 - self.args.tau) * target_param.data)
 
-        if self.global_step % 100 == 0:
-            self.writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), self.global_step)
-            self.writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), self.global_step)
-            self.writer.add_scalar("losses/qf1_loss", qf1_loss.item(), self.global_step)
-            self.writer.add_scalar("losses/qf2_loss", qf2_loss.item(), self.global_step)
-            self.writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, self.global_step)
-            self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
-            self.writer.add_scalar("losses/alpha", self.alpha, self.global_step)
-            print("SPS:", int(self.global_step / (time.time() - self.start_time)))
-            self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - self.start_time)), self.global_step)
+        if self.global_update_step % 100 == 0:
+
+            wandb.log({"sac_losses/qf1_values": qf1_a_values.mean().item(),
+                       "sac_losses/qf2_values": qf2_a_values.mean().item(),
+                       "sac_losses/qf1_loss": qf1_loss.item(), 
+                       "sac_losses/qf2_loss": qf2_loss.item(),
+                       "sac_losses/qf_loss": qf_loss.item() / 2.0,
+                       "sac_losses/actor_loss": actor_loss.item(),
+                       "sac_losses/alpha": self.alpha}, step=self.glob_agent_step)
+                       
+            log.info("SPS:", int(self.global_update_step / (time.time() - self.start_time)))
+            
+            wandb.log({"charts/SPS": int(self.global_update_step / (time.time() - self.start_time))},
+                      step=self.glob_agent_step)
             if self.args.autotune:
-                self.writer.add_scalar("losses/alpha_loss", alpha_loss.item(), self.global_step)
-        self.global_step += 1
-
-    # def cleanrlepisode(self, env, warm_up=False, train=True, verbosity=0, _log=None):
-
-    #     # TRY NOT TO MODIFY: start the game
-    #     obs = env.reset()
-    #     for global_step in range(self.args.total_timesteps):
-    #         # ALGO LOGIC: put action logic here
-    #         if global_step < self.args.learning_starts:
-    #             # actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-    #             # actions = np.array([env.action_space.sample() for _ in range(env.ensemble_size)])
-    #             actions = env.action_space.sample()
-    #             actions = torch.from_numpy(actions)
-    #         else:
-    #             actions, _, _ = self.actor.get_action(torch.Tensor(obs).to(self.device))
-    #             actions = actions.detach().cpu().numpy()
-
-    #         # TRY NOT TO MODIFY: execute the game and log data.
-    #         next_obs, rewards, dones, infos = env.step(actions) #envs.step(actions)
-
-    #         # TRY NOT TO MODIFY: record rewards for plotting purposes
-    #         for info in infos:
-    #             if "episode" in info.keys():
-    #                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-    #                 self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-    #                 self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-    #                 break
-
-    #         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
-    #         real_next_obs = next_obs.copy()
-    #         for idx, d in enumerate(dones):
-    #             if d:
-    #                 real_next_obs[idx] = infos[idx]["terminal_observation"]
-    #         self.replay.add(obs, real_next_obs, actions, rewards, dones, infos)
-
-    #         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-    #         obs = next_obs
-
-    #         # ALGO LOGIC: training.
-    #         if global_step > self.args.learning_starts:
-    #             if global_step % self.args.update_frequency == 0:
-    #                 data = self.replay.sample(self.args.batch_size)
-    #                 # CRITIC training
-    #                 with torch.no_grad():
-    #                     _, next_state_log_pi, next_state_action_probs = self.actor.get_action(data.next_observations)
-    #                     qf1_next_target = self.qf1_target(data.next_observations)
-    #                     qf2_next_target = self.qf2_target(data.next_observations)
-    #                     # we can use the action probabilities instead of MC sampling to estimate the expectation
-    #                     min_qf_next_target = next_state_action_probs * (
-    #                         torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-    #                     )
-    #                     # adapt Q-target for discrete Q-function
-    #                     min_qf_next_target = min_qf_next_target.sum(dim=1)
-    #                     next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.args.gamma * (min_qf_next_target)
-
-    #                 # use Q-values only for the taken actions
-    #                 qf1_values = self.qf1(data.observations)
-    #                 qf2_values = self.qf2(data.observations)
-    #                 qf1_a_values = qf1_values.gather(1, data.actions.long()).view(-1)
-    #                 qf2_a_values = qf2_values.gather(1, data.actions.long()).view(-1)
-    #                 qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-    #                 qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-    #                 qf_loss = qf1_loss + qf2_loss
-
-    #                 self.q_optimizer.zero_grad()
-    #                 qf_loss.backward()
-    #                 self.q_optimizer.step()
-
-    #                 # ACTOR training
-    #                 _, log_pi, action_probs = self.actor.get_action(data.observations)
-    #                 with torch.no_grad():
-    #                     qf1_values = self.qf1(data.observations)
-    #                     qf2_values = self.qf2(data.observations)
-    #                     min_qf_values = torch.min(qf1_values, qf2_values)
-    #                 # no need for reparameterization, the expectation can be calculated for discrete actions
-    #                 actor_loss = (action_probs * ((self.alpha * log_pi) - min_qf_values)).mean()
-
-    #                 self.actor_optimizer.zero_grad()
-    #                 actor_loss.backward()
-    #                 self.actor_optimizer.step()
-
-    #                 if self.args.autotune:
-    #                     # re-use action probabilities for temperature loss
-    #                     alpha_loss = (action_probs.detach() * (-self.log_alpha * (log_pi + self.target_entropy).detach())).mean()
-
-    #                     self.a_optimizer.zero_grad()
-    #                     alpha_loss.backward()
-    #                     self.a_optimizer.step()
-    #                     self.alpha = self.log_alpha.exp().item()
-
-    #             # update the target networks
-    #             if global_step % self.args.target_network_frequency == 0:
-    #                 for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
-    #                     target_param.data.copy_(self.args.tau * param.data + (1 - self.args.tau) * target_param.data)
-    #                 for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
-    #                     target_param.data.copy_(self.args.tau * param.data + (1 - self.args.tau) * target_param.data)
-
-    #             if global_step % 100 == 0:
-    #                 self.writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-    #                 self.writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-    #                 self.writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-    #                 self.writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-    #                 self.writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-    #                 self.writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-    #                 self.writer.add_scalar("losses/alpha", self.alpha, global_step)
-    #                 print("SPS:", int(global_step / (time.time() - self.start_time)))
-    #                 self.writer.add_scalar("charts/SPS", int(global_step / (time.time() - self.start_time)), global_step)
-    #                 if self.args.autotune:
-    #                     self.writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
-
-    #     # envs.close()
-    #     # self.writer.close()
+                wandb.log({"sac_losses/alpha_loss": alpha_loss.item()}, step=self.glob_agent_step)
+                
+        self.global_update_step += 1
+        self.glob_agent_step += 1
+        
+        return self.global_update_step

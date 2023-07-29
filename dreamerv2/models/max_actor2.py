@@ -2,6 +2,7 @@ import torch.nn as nn
 import numpy as np
 import torch
 
+import wandb
 import os
 import sys 
 from datetime import datetime
@@ -20,9 +21,7 @@ from MAX.imagination import Imagination
 # from sac import SAC
 from dreamerv2.models.sac_discrete import SAC
 
-# import gym
-# import envs
-# from MAX.wrappers import BoundedActionsEnv, RecordedEnv, NoisyEnv
+import logging
 
 device=None
 
@@ -120,6 +119,7 @@ class MaxActionModel(nn.Module):
 
         self.utility = self.get_utility_measure()
 
+        self._log = logging.getLogger(__name__)
         self.env = env
         self.buffer = None
         self.exploration_measure = self.utility
@@ -131,6 +131,8 @@ class MaxActionModel(nn.Module):
         self.state = None
         self.init_max_exploration()
 
+        self.glob_agent_step = 0
+        
     def get_utility_measure(self):
         
         if self.utility_measure == 'cp_stdev':
@@ -153,7 +155,7 @@ class MaxActionModel(nn.Module):
             raise Exception('invalid utility measure')
         
     def forward(self):
-        action, action_dist = self.do_max_exploration(None, None)
+        action, action_dist = self.do_max_exploration(None)
         return action, action_dist
 
     def get_action_dist(self, modelstate):
@@ -183,49 +185,58 @@ class MaxActionModel(nn.Module):
             self.buffer.train_batches(batch_size=self.batch_size):
 
             self.optimizer.zero_grad()
-            with torch.enable_grad():
-                loss = self.model.loss(tr_states, tr_actions, tr_state_deltas, 
-                    training_noise_stdev=self.training_noise_stdev)
+            # with torch.enable_grad():
+            loss = self.model.loss(tr_states, tr_actions, tr_state_deltas, 
+                training_noise_stdev=self.training_noise_stdev)
             losses.append(loss.item())
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
         return np.mean(losses)
 
-    def fit_model(self, buffer, n_epochs, step_num, mode, _log=None, _run=None):
+    def fit_model(self, buffer, n_epochs, step_num, mode, _run=None):
             
         self.model = self._build_model()
         self.model.setup_normalizer(self.normalizer)
         self.optimizer = torch.optim.Adam(self.model.parameters(), 
             lr=self.learning_rate, weight_decay=self.weight_decay)
 
-        # if self.verbosity:
-        #     _log.info(f"step: {step_num}\t training")
+        if self.verbosity and self._log:
+            self._log.info(f"step: {step_num}\t training")
         
+        tr_loss_list = []
         for epoch_i in range(1, n_epochs + 1):
             tr_loss = self.train_epoch()
-            # if self.verbosity >= 2:
-            #     _log.info(f'epoch: {epoch_i:3d} training_loss: {tr_loss:.2f}')
+            tr_loss_list.append(tr_loss)
 
-        # _log.info(f"step: {step_num}\t training done for {n_epochs} epochs, final loss: {np.round(tr_loss, 3)}")
-        # if mode == 'explore':
-        #     _run.log_scalar("explore_loss", tr_loss, step_num)
+        if self.verbosity and self._log:
+            self._log.info(f"step: {step_num}\t training done for {n_epochs} epochs, final loss: {np.round(tr_loss, 3)}")
+            
+        wandb.log({'max/mean_trloss': np.mean(tr_loss_list)}, step=step_num)
+        wandb.log({'max/mean_final_tr_loss': tr_loss}, step=step_num)
 
+            
     """
     Planning
     """
-    def get_policy(self, _log=None):
+    def get_policy(self):
 
-        # , buffer, model, measure
-
-        # if self.verbosity:
-        #     _log.info("... getting fresh agent")
+        if self.verbosity and self._log:
+            self._log.info("... getting fresh agent")
 
         size = len(self.buffer)
-
-        self.agent = SAC(d_state=self.d_state, d_action=self.d_action, replay_size=self.policy_replay_size, 
-            batch_size=self.policy_batch_size, n_updates=self.policy_active_updates, n_hidden=self.policy_n_hidden, 
-            gamma=self.policy_gamma, alpha=self.policy_explore_alpha, lr=self.policy_lr, tau=self.policy_tau, env=self.mdp)
+        self.agent = SAC(d_state=self.d_state,
+                         d_action=self.d_action,
+                         replay_size=self.policy_replay_size,
+                         batch_size=self.policy_batch_size,
+                         n_updates=self.policy_active_updates,
+                         n_hidden=self.policy_n_hidden,
+                         gamma=self.policy_gamma,
+                         alpha=self.policy_explore_alpha,
+                         lr=self.policy_lr,
+                         tau=self.policy_tau,
+                         env=self.mdp,
+                         glob_agent_step = self.glob_agent_step)
 
         self.agent = self.agent.to(device)
         self.agent.setup_normalizer(self.normalizer)
@@ -233,8 +244,8 @@ class MaxActionModel(nn.Module):
         if not self.buffer_reuse:
             return self.agent
 
-        # if self.verbosity:
-        #     _log.info("... transferring exploration buffer")
+        if self.verbosity and self._log:
+            self._log.info("... transferring exploration buffer")
 
         for i in range(0, size, 1024):
  
@@ -248,7 +259,10 @@ class MaxActionModel(nn.Module):
  
             r = self.utility(s, a, ns, mu, var, self.model)
             self.agent.replay.add_batch(s, ns, a, r, np.zeros(0), [{}])
-        
+            # s : [size, state_size], r : [size]
+            wandb.log({'max/utility_mean' : r.mean(),
+                       'max/utility_min' : r.min(),
+                       'max/utility_max' : r.max()})
 
     def get_action(self):
         current_state = self.mdp.reset()
@@ -257,14 +271,14 @@ class MaxActionModel(nn.Module):
         # probs = action[1].detach().data.cpu().numpy()
         # policy_value = torch.mean(agent.get_state_value(current_state)).item()
         # return action, probs, mdp, agent, policy_value
-        print(f"get_action: {current_state.shape=}")
-        actions, log_pi, action_probs = self.agent.actor.get_action(current_state)
+        # print(f"get_action: {current_state.shape=}")
+        actions, log_pi, action_probs = self.agent.act_in_env(current_state)
         qf1_values = self.agent.qf1(current_state.unsqueeze(1).repeat(self.policy_evaluation_batch_size, 1, 1))
         qf2_values = self.agent.qf2(current_state.unsqueeze(1).repeat(self.policy_evaluation_batch_size, 1, 1))
         policy_value = torch.min(qf1_values, qf2_values).mean(dim=0).squeeze()
         return actions, action_probs, self.mdp, self.agent, policy_value
 
-    def act(self, mode='explore', _run=None, _log=None):
+    def act(self, mode='explore', _run=None):
         policy_horizon = self.policy_explore_horizon
         policy_episodes = self.policy_explore_episodes
 
@@ -287,8 +301,8 @@ class MaxActionModel(nn.Module):
             return self.get_action()
 
         # reactive updates
-        for update_idx in range(self.policy_reactive_updates):  ### ????
-            self.agent.update()
+        for update_idx in range(self.policy_reactive_updates):
+            self.glob_agent_step += self.agent.update()
 
         # active updates -- perform active exploration
         # to be fair to reactive methods, clear real env data in SAC buffer, to prevent further gradient updates from it.
@@ -298,33 +312,35 @@ class MaxActionModel(nn.Module):
         ep_returns = []
         best_return, best_params = -np.inf, deepcopy(self.agent.state_dict())
         for ep_i in range(policy_episodes):
-            print(f"{ep_i} policy episode")
             warm_up = True if ((ep_i < self.policy_warm_up_episodes) and fresh_agent) else False
-            ep_return = self.agent.episode(env=self.mdp, warm_up=warm_up, verbosity=self.verbosity, _log=_log)
+            ep_return = self.agent.episode(env=self.mdp, warm_up=warm_up, verbosity=self.verbosity)
             ep_returns.append(ep_return)
 
             if self.use_best_policy and ep_return > best_return:
                 best_return, best_params = ep_return, deepcopy(self.agent.state_dict())
 
-            # if self.verbosity:
-            #     step_return = ep_return / policy_horizon
-            #     _log.info(f"\tep: {ep_i}\taverage step return: {np.round(step_return, 3)}")
-
+            if self.verbosity:
+                step_return = ep_return / policy_horizon
+                wandb.log({'max/step_return': np.round(step_return, 3)}, step=ep_i)  # TODO: wnadb?
+                if self._log:
+                    self._log.info(f"\tep: {ep_i}\taverage step return: {np.round(step_return, 3)}")
+                
         if self.use_best_policy:
             self.agent.load_state_dict(best_params)
 
-            # if mode == 'explore' and len(ep_returns) >= 3:
-            #     first_return = ep_returns[0]
-            #     last_return = max(ep_returns) if self.use_best_policy else ep_returns[-1]
-            #     _run.log_scalar("policy_improvement_first_return", first_return / policy_horizon)
-            #     _run.log_scalar("policy_improvement_second_return", ep_returns[1] / policy_horizon)
-            #     _run.log_scalar("policy_improvement_last_return", last_return / policy_horizon)
-            #     _run.log_scalar("policy_improvement_max_return", max(ep_returns) / policy_horizon)
-            #     _run.log_scalar("policy_improvement_min_return", min(ep_returns) / policy_horizon)
-            #     _run.log_scalar("policy_improvement_median_return", np.median(ep_returns) / policy_horizon)
-            #     _run.log_scalar("policy_improvement_first_last_delta", (last_return - first_return) / policy_horizon)
-            #     _run.log_scalar("policy_improvement_second_last_delta", (last_return - ep_returns[1]) / policy_horizon)
-            #     _run.log_scalar("policy_improvement_median_last_delta", (last_return - np.median(ep_returns)) / policy_horizon)
+            if len(ep_returns) >= 3:
+                first_return = ep_returns[0]
+                last_return = max(ep_returns) if self.use_best_policy else ep_returns[-1]
+                
+                wandb.log({'max/policy_improvement_first_return': first_return / policy_horizon,
+                           'max/policy_improvement_second_return':  ep_returns[1] / policy_horizon,
+                           'max/policy_improvement_last_return': last_return / policy_horizon,
+                           'max/policy_improvement_max_return': max(ep_returns) / policy_horizon,
+                           'max/policy_improvement_min_return': min(ep_returns) / policy_horizon,
+                           'max/policy_improvement_median_return': np.median(ep_returns) / policy_horizon,
+                           'max/policy_improvement_first_last_delta': (last_return - first_return) / policy_horizon,
+                           'max/policy_improvement_second_last_delta': (last_return - ep_returns[1]) / policy_horizon,
+                           'max/policy_improvement_median_last_delta': (last_return - np.median(ep_returns)) / policy_horizon},)
 
         return self.get_action()
 
@@ -379,7 +395,7 @@ class MaxActionModel(nn.Module):
         self.state = self.env.reset()
         self.step_num = 1
 
-    def do_max_exploration(self, _log=None, _run=None) -> None:
+    def do_max_exploration(self, _run=None) -> None:
         self.step_num += 1
         if self.step_num > self.n_warm_up_steps:
             action, probs, mdp, agent, policy_value = self.act(mode='explore')
@@ -388,9 +404,14 @@ class MaxActionModel(nn.Module):
 
             # _run.log_scalar("action_norm", np.sum(np.square(action)), step_num)
             # _run.log_scalar("exploration_policy_value", policy_value, step_num)
-
-            if self.action_noise_stdev: # = 0
-                action = action + np.random.normal(scale=self.action_noise_stdev, size=action.shape)
+            # print(policy_value)
+            # print(action)
+            # print(action.shape)     # TODO
+            wandb.log({'max/exploration_policy_value': policy_value.detach(),},
+                      step=self.step_num)
+            
+            # if self.action_noise_stdev: # = 0
+            #     action = action + np.random.normal(scale=self.action_noise_stdev, size=action.shape)
         else:
             action = self.env.action_space.sample()
             probs = np.ones_like(action) / len(action)
@@ -401,6 +422,10 @@ class MaxActionModel(nn.Module):
         self.buffer.add(self.state.numpy(), action, next_state.numpy())
 
         # if self.step_num > self.n_warm_up_steps:
+        #     wandb.log({'experience_novelty': self.transition_novelty(self, state, # TODO
+        #                                                              action,
+        #                                                              next_state,)},
+                      # step=self.step_num)
         #     _run.log_scalar("experience_novelty", 
         #     self.transition_novelty(self.state, action, next_state, model=self.model), self.step_num)
 
@@ -408,7 +433,8 @@ class MaxActionModel(nn.Module):
         #     self.env.self.render()
             
         if done:
-            # _log.info(f"step: {self.step_num}\tepisode complete")
+            if self._log:
+                self._log.info(f"step: {self.step_num}\tepisode complete")
             self.agent = None
             self.mdp = None
 
@@ -453,42 +479,3 @@ class MaxActionModel(nn.Module):
                 # if self.record:
                 #     _run.add_artifact(video_filename)
         return action, probs
-
-    # def evaluate_utility(self, buffer, env, _log, _run):
-    #     """
-    #     env -- our dreamer-encoded real env
-    #     """
-    #     measure = self.utility
-
-    #     achieved_utilities = []
-    #     for ep_idx in range(1, self.n_eval_episodes + 1):
-    #         state = env.re
-    #         ep_length = 0
-
-    #         model = self.fit_model(buffer=buffer, n_epochs=self.exploring_model_epochs, step_num=0, mode='explore')
-    #         agent = None
-    #         mdp = None
-    #         done = False
-
-    #         while not done:
-    #             action, mdp, agent, _ = self.act(state=state, agent=agent, mdp=mdp, 
-    #                 buffer=buffer, model=model, measure=measure, mode='explore')
-    #             next_state, _, done, info = env.step(action)
-    #             ep_length += 1
-    #             ep_utility += self.transition_novelty(state, action, next_state, model=model)
-    #             state = next_state
-
-    #             if ep_length % self.model_train_freq == 0:
-    #                 model = self.fit_model(buffer=buffer, n_epochs=self.exploring_model_epochs, step_num=ep_length, mode='explore')
-    #                 mdp = None
-    #                 agent = None
-
-    #         achieved_utilities.append(ep_utility)
-    #         _log.info(f"{ep_idx}\tplanning utility: {ep_utility}")
-
-    #     env.close()
-
-    #     _run.result = np.mean(achieved_utilities)
-    #     _log.info(f"average planning utility: {np.mean(achieved_utilities)}")
-
-    #     return np.mean(achieved_utilities)
